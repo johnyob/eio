@@ -130,13 +130,13 @@ type t = {
   mutable fd_map : fd_event_waiters Fd_map.t;   (* Used for mapping readable/writable poll handles *)
 }
 
-type _ Effect.t += Await : (Luv.Loop.t -> Eio.Private.Fiber_context.t -> ('a -> unit) -> unit) -> 'a Effect.t
+exception%effect Await : (Luv.Loop.t -> Eio.Private.Fiber_context.t -> ('a -> unit) -> unit) -> 'a
 
-type _ Effect.t += Enter : (t -> 'a Suspended.t -> unit) -> 'a Effect.t
-type _ Effect.t += Enter_unchecked : (t -> 'a Suspended.t -> unit) -> 'a Effect.t
+exception%effect Enter : (t -> 'a Suspended.t -> unit) -> 'a
+exception%effect Enter_unchecked : (t -> 'a Suspended.t -> unit) -> 'a
 
-let enter fn = Effect.perform (Enter fn)
-let enter_unchecked fn = Effect.perform (Enter_unchecked fn)
+let enter fn = perform (Enter fn)
+let enter_unchecked fn = perform (Enter_unchecked fn)
 
 let enqueue_thread t k v =
   Lf_queue.push t.run_q (Thread (fun () -> Suspended.clear_cancel_fn k; Suspended.continue k v));
@@ -291,10 +291,10 @@ module Low_level = struct
     Suspended.continue k t.loop
 
   let await fn =
-    Effect.perform (Await fn)
+    perform (Await fn)
 
   let await_exn fn =
-    Effect.perform (Await fn) |> or_raise
+    perform (Await fn) |> or_raise
 
   let await_with_cancel ~request fn =
     enter (fun st k ->
@@ -1209,92 +1209,75 @@ let rec run : type a. (_ -> a) -> a = fun main ->
   let stdenv = stdenv ~run_event_loop:run in
   let rec fork ~new_fiber:fiber fn =
     Ctf.note_switch (Fiber_context.tid fiber);
-    let open Effect.Deep in
-    match_with fn ()
-    { retc = (fun () -> Fiber_context.destroy fiber);
-      exnc = (fun e -> Fiber_context.destroy fiber; raise e);
-      effc = fun (type a) (e : a Effect.t) ->
-        match e with
-        | Await fn ->
-          Some (fun k ->
-            let k = { Suspended.k; fiber } in
-            fn loop fiber (enqueue_thread st k))
-        | Eio.Private.Effects.Fork (new_fiber, f) ->
-          Some (fun k ->
-              let k = { Suspended.k; fiber } in
-              enqueue_at_head st k ();
-              fork ~new_fiber f
-            )
-        | Eio.Private.Effects.Get_context -> Some (fun k -> continue k fiber)
-        | Enter_unchecked fn -> Some (fun k ->
-            fn st { Suspended.k; fiber }
-          )
-        | Enter fn -> Some (fun k ->
-            match Fiber_context.get_error fiber with
-            | Some e -> discontinue k e
-            | None -> fn st { Suspended.k; fiber }
-          )
-        | Eio.Private.Effects.Suspend fn ->
-          Some (fun k ->
-              let k = { Suspended.k; fiber } in
-              fn fiber (enqueue_result_thread st k)
-            )
-        | Eio_unix.Private.Await_readable fd -> Some (fun k ->
-            match Fiber_context.get_error fiber with
-            | Some e -> discontinue k e
-            | None ->
-              let k = { Suspended.k; fiber } in
-              Poll.await_readable st k fd
-          )
-        | Eio_unix.Private.Await_writable fd -> Some (fun k ->
-            match Fiber_context.get_error fiber with
-            | Some e -> discontinue k e
-            | None ->
-              let k = { Suspended.k; fiber } in
-              Poll.await_writable st k fd
-          )
-        | Eio_unix.Private.Get_monotonic_clock -> Some (fun k -> continue k mono_clock)
-        | Eio_unix.Private.Socket_of_fd (sw, close_unix, fd) -> Some (fun k ->
-            match
-              let fd = Low_level.Stream.of_unix fd in
-              let sock = Luv.TCP.init ~loop () |> or_raise in
-              let handle = Handle.of_luv ~sw ~close_unix sock in
-              Luv.TCP.open_ sock fd |> or_raise;
-              (socket handle :> Eio_unix.socket)
-            with
-            | sock -> continue k sock
-            | exception (Eio.Io _ as ex) -> discontinue k ex
-          )
-        | Eio_unix.Private.Socketpair (sw, domain, ty, protocol) -> Some (fun k ->
-            match
-              if domain <> Unix.PF_UNIX then failwith "Only PF_UNIX sockets are supported by libuv";
-              let ty =
-                match ty with
-                | Unix.SOCK_DGRAM -> `DGRAM
-                | Unix.SOCK_STREAM -> `STREAM
-                | Unix.SOCK_RAW -> `RAW
-                | Unix.SOCK_SEQPACKET -> failwith "Type SEQPACKET not support by libuv"
-              in
-              let a, b = Luv.TCP.socketpair ty protocol |> or_raise in
-              let wrap x =
-                let sock = Luv.TCP.init ~loop () |> or_raise in
-                Luv.TCP.open_ sock x |> or_raise;
-                let h = Handle.of_luv ~sw ~close_unix:true sock in
-                (socket h :> Eio_unix.socket)
-              in
-              (wrap a, wrap b)
-            with
-            | x -> continue k x
-            | exception (Eio.Io _ as ex) -> discontinue k ex
-          )
-          | Eio_unix.Private.Pipe sw -> Some (fun k ->
-            let r, w = Luv.Pipe.pipe ~read_flags:[] ~write_flags:[] () |> or_raise in
-            let r = (flow (File.of_luv ~close_unix:true ~sw r) :> <Eio.Flow.source; Eio.Flow.close; Eio_unix.unix_fd>) in
-            let w = (flow (File.of_luv ~close_unix:true ~sw w) :> <Eio.Flow.sink; Eio.Flow.close; Eio_unix.unix_fd>) in
-            continue k (r, w)
-          )
-        | _ -> None
-    }
+    match fn () with
+    | () -> Fiber_context.destroy fiber
+    | exception ex -> Fiber_context.destroy fiber; raise ex
+    | [%effect? Await fn, k] ->
+      let k = { Suspended.k; fiber } in
+      fn loop fiber (enqueue_thread st k)
+    | [%effect? Eio.Private.Effects.Fork (new_fiber, f), k] ->
+      let k = { Suspended.k; fiber } in
+      enqueue_at_head st k ();
+      fork ~new_fiber f
+    | [%effect? Eio.Private.Effects.Get_context, k] -> continue k fiber
+    | [%effect? Enter_unchecked fn, k] ->
+      fn st { Suspended.k; fiber }
+    | [%effect? Enter fn, k] ->
+      (match Fiber_context.get_error fiber with
+      | Some e -> discontinue k e
+      | None -> fn st { Suspended.k; fiber })   
+    | [%effect? Eio.Private.Effects.Suspend fn, k] ->
+      let k = { Suspended.k; fiber } in
+      fn fiber (enqueue_result_thread st k)
+    | [%effect? Eio_unix.Private.Await_readable fd, k] ->
+      (match Fiber_context.get_error fiber with
+      | Some e -> discontinue k e
+      | None ->
+        let k = { Suspended.k; fiber } in
+        Poll.await_readable st k fd)
+    | [%effect? Eio_unix.Private.Await_writable fd, k] ->
+      (match Fiber_context.get_error fiber with
+      | Some e -> discontinue k e
+      | None ->
+        let k = { Suspended.k; fiber } in
+        Poll.await_writable st k fd)
+    | [%effect? Eio_unix.Private.Get_monotonic_clock, k] -> continue k mono_clock
+    | [%effect? Eio_unix.Private.Socket_of_fd (sw, close_unix, fd), k] ->
+      (match
+        let fd = Low_level.Stream.of_unix fd in
+        let sock = Luv.TCP.init ~loop () |> or_raise in
+        let handle = Handle.of_luv ~sw ~close_unix sock in
+        Luv.TCP.open_ sock fd |> or_raise;
+        (socket handle :> Eio_unix.socket)
+      with
+      | sock -> continue k sock
+      | exception (Eio.Io _ as ex) -> discontinue k ex)
+    | [%effect? Eio_unix.Private.Socketpair (sw, domain, ty, protocol), k] ->
+      (match
+        if domain <> Unix.PF_UNIX then failwith "Only PF_UNIX sockets are supported by libuv";
+        let ty =
+          match ty with
+          | Unix.SOCK_DGRAM -> `DGRAM
+          | Unix.SOCK_STREAM -> `STREAM
+          | Unix.SOCK_RAW -> `RAW
+          | Unix.SOCK_SEQPACKET -> failwith "Type SEQPACKET not support by libuv"
+        in
+        let a, b = Luv.TCP.socketpair ty protocol |> or_raise in
+        let wrap x =
+          let sock = Luv.TCP.init ~loop () |> or_raise in
+          Luv.TCP.open_ sock x |> or_raise;
+          let h = Handle.of_luv ~sw ~close_unix:true sock in
+          (socket h :> Eio_unix.socket)
+        in
+        (wrap a, wrap b)
+      with
+      | x -> continue k x
+      | exception (Eio.Io _ as ex) -> discontinue k ex)
+    | [%effect? Eio_unix.Private.Pipe sw, k] ->
+      let r, w = Luv.Pipe.pipe ~read_flags:[] ~write_flags:[] () |> or_raise in
+      let r = (flow (File.of_luv ~close_unix:true ~sw r) :> <Eio.Flow.source; Eio.Flow.close; Eio_unix.unix_fd>) in
+      let w = (flow (File.of_luv ~close_unix:true ~sw w) :> <Eio.Flow.sink; Eio.Flow.close; Eio_unix.unix_fd>) in
+      continue k (r, w)
   in
   let main_status = ref `Running in
   let new_fiber = Fiber_context.make_root () in

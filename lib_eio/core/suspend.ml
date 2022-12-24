@@ -1,7 +1,8 @@
 type 'a enqueue = ('a, exn) result -> unit
-type _ Effect.t += Suspend : (Cancel.fiber_context -> 'a enqueue -> unit) -> 'a Effect.t
 
-let enter_unchecked fn = Effect.perform (Suspend fn)
+exception%effect Suspend : (Cancel.fiber_context -> 'a enqueue -> unit) -> 'a
+
+let enter_unchecked fn = perform (Suspend fn)
 
 let enter fn =
   enter_unchecked @@ fun fiber enqueue ->

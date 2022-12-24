@@ -90,16 +90,13 @@ module Private : sig
   type _ Eio.Generic.ty += Unix_file_descr : [`Peek | `Take] -> Unix.file_descr Eio.Generic.ty
   (** See {!FD}. *)
 
-  type _ Effect.t += 
-    | Await_readable : Unix.file_descr -> unit Effect.t      (** See {!await_readable} *)
-    | Await_writable : Unix.file_descr -> unit Effect.t      (** See {!await_writable} *)
-    | Get_monotonic_clock : Eio.Time.Mono.t Effect.t
-    | Socket_of_fd : Switch.t * bool * Unix.file_descr ->
-        socket Effect.t                                      (** See {!FD.as_socket} *)
-    | Socketpair : Eio.Switch.t * Unix.socket_domain * Unix.socket_type * int ->
-        (socket * socket) Effect.t                           (** See {!socketpair} *)
-    | Pipe : Eio.Switch.t -> 
-        (<Eio.Flow.source; Eio.Flow.close; unix_fd> * <Eio.Flow.sink; Eio.Flow.close; unix_fd>) Effect.t (** See {!pipe} *)
+
+  exception%effect Await_readable : Unix.file_descr -> unit (** See {!await_readable} *)
+  exception%effect Await_writable : Unix.file_descr -> unit (** See {!await_writable} *)
+  exception%effect Get_monotonic_clock : Eio.Time.Mono.t 
+  exception%effect Socket_of_fd : Eio.Switch.t * bool * Unix.file_descr -> socket (** See {!FD.as_socket} *)
+  exception%effect Socketpair : Eio.Switch.t * Unix.socket_domain * Unix.socket_type * int -> (socket * socket)  (** See {!socketpair} *)
+  exception%effect Pipe : Eio.Switch.t -> (<Eio.Flow.source; Eio.Flow.close; unix_fd> * <Eio.Flow.sink; Eio.Flow.close; unix_fd>) (** See {!pipe} *)
 end
 
 module Ctf = Ctf_unix

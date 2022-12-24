@@ -18,20 +18,19 @@ type socket = <
 module Private = struct
   type _ Eio.Generic.ty += Unix_file_descr : [`Peek | `Take] -> Unix.file_descr Eio.Generic.ty
 
-  type _ Effect.t += 
-    | Await_readable : Unix.file_descr -> unit Effect.t
-    | Await_writable : Unix.file_descr -> unit Effect.t
-    | Get_monotonic_clock : Eio.Time.Mono.t Effect.t
-    | Socket_of_fd : Eio.Switch.t * bool * Unix.file_descr -> socket Effect.t
-    | Socketpair : Eio.Switch.t * Unix.socket_domain * Unix.socket_type * int -> (socket * socket) Effect.t
-    | Pipe : Eio.Switch.t -> (<Eio.Flow.source; Eio.Flow.close; unix_fd> * <Eio.Flow.sink; Eio.Flow.close; unix_fd>) Effect.t
+  exception%effect Await_readable : Unix.file_descr -> unit
+  exception%effect Await_writable : Unix.file_descr -> unit
+  exception%effect Get_monotonic_clock : Eio.Time.Mono.t 
+  exception%effect Socket_of_fd : Eio.Switch.t * bool * Unix.file_descr -> socket
+  exception%effect Socketpair : Eio.Switch.t * Unix.socket_domain * Unix.socket_type * int -> (socket * socket)
+  exception%effect Pipe : Eio.Switch.t -> (<Eio.Flow.source; Eio.Flow.close; unix_fd> * <Eio.Flow.sink; Eio.Flow.close; unix_fd>)
 end
 
-let await_readable fd = Effect.perform (Private.Await_readable fd)
-let await_writable fd = Effect.perform (Private.Await_writable fd)
+let await_readable fd = perform (Private.Await_readable fd)
+let await_writable fd = perform (Private.Await_writable fd)
 
 let sleep d =
-  Eio.Time.Mono.sleep (Effect.perform Private.Get_monotonic_clock) d
+  Eio.Time.Mono.sleep (perform Private.Get_monotonic_clock) d
 
 let run_in_systhread fn =
   let f fiber enqueue =
@@ -41,7 +40,7 @@ let run_in_systhread fn =
       let _t : Thread.t = Thread.create (fun () -> enqueue (try Ok (fn ()) with exn -> Error exn)) () in
       ()
   in
-  Effect.perform (Eio.Private.Effects.Suspend f)
+  perform (Eio.Private.Effects.Suspend f)
 
 module FD = struct
   let peek x = x#unix_fd `Peek
@@ -50,13 +49,13 @@ module FD = struct
   let peek_opt x = Eio.Generic.probe x (Private.Unix_file_descr `Peek)
   let take_opt x = Eio.Generic.probe x (Private.Unix_file_descr `Take)
 
-  let as_socket ~sw ~close_unix fd = Effect.perform (Private.Socket_of_fd (sw, close_unix, fd))
+  let as_socket ~sw ~close_unix fd = perform (Private.Socket_of_fd (sw, close_unix, fd))
 end
 
 let socketpair ~sw ?(domain=Unix.PF_UNIX) ?(ty=Unix.SOCK_STREAM) ?(protocol=0) () =
-  Effect.perform (Private.Socketpair (sw, domain, ty, protocol))
+  perform (Private.Socketpair (sw, domain, ty, protocol))
 
-let pipe sw = Effect.perform (Private.Pipe sw)
+let pipe sw = perform (Private.Pipe sw)
 
 module Ipaddr = struct
   let to_unix : _ Eio.Net.Ipaddr.t -> Unix.inet_addr = Obj.magic

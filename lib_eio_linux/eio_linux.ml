@@ -50,7 +50,7 @@ let wrap_error_fs code name arg =
   | Unix.EXDEV -> Eio.Fs.err (Permission_denied e)
   | _ -> wrap_error code name arg
 
-type _ Effect.t += Close : Unix.file_descr -> int Effect.t
+exception%effect Close : Unix.file_descr -> int
 
 module FD = struct
   type t = {
@@ -78,7 +78,7 @@ module FD = struct
     t.fd <- `Closed;
     Eio.Switch.remove_hook t.release_hook;
     if t.close_unix then (
-      let res = Effect.perform (Close fd) in
+      let res = perform (Close fd) in
       Log.debug (fun l -> l "close: woken up");
       if res < 0 then
         raise (wrap_error (Uring.error_of_errno res) "close" (string_of_int (Obj.magic fd : int)))
@@ -239,9 +239,9 @@ let enqueue_failed_thread st k ex =
 let enqueue_at_head st k x =
   Lf_queue.push_head st.run_q (Thread (k, x))
 
-type _ Effect.t += Enter : (t -> 'a Suspended.t -> unit) -> 'a Effect.t
-type _ Effect.t += Cancel : io_job Uring.job -> unit Effect.t
-let enter fn = Effect.perform (Enter fn)
+exception%effect Enter : (t -> 'a Suspended.t -> unit) -> 'a
+exception%effect Cancel : io_job Uring.job -> unit
+let enter fn = perform (Enter fn)
 
 (* Cancellations always come from the same domain, so no need to send wake events here. *)
 let rec enqueue_cancel job st =
@@ -251,7 +251,7 @@ let rec enqueue_cancel job st =
   | None -> Queue.push (fun st -> enqueue_cancel job st) st.io_q
   | Some _ -> ()
 
-let cancel job = Effect.perform (Cancel job)
+let cancel job = perform (Cancel job)
 
 (* Cancellation
 
@@ -679,21 +679,20 @@ module Low_level = struct
     Log.debug (fun l -> l "noop returned");
     if result <> 0 then raise (unclassified_error (Eio_unix.Unix_error (Uring.error_of_errno result, "noop", "")))
 
-  type _ Effect.t += Sleep_until : Mtime.t -> unit Effect.t
-  let sleep_until d =
-    Effect.perform (Sleep_until d)
+  exception%effect Sleep_until : Mtime.t -> unit
+  let sleep_until d = perform (Sleep_until d)
 
-  type _ Effect.t += ERead : (Optint.Int63.t option * FD.t * Uring.Region.chunk * amount) -> int Effect.t
+  exception%effect ERead : (Optint.Int63.t option * FD.t * Uring.Region.chunk * amount) -> int
 
   let read_exactly ?file_offset fd buf len =
-    let res = Effect.perform (ERead (file_offset, fd, buf, Exactly len)) in
+    let res = perform (ERead (file_offset, fd, buf, Exactly len)) in
     Log.debug (fun l -> l "read_exactly: woken up after read");
     if res < 0 then (
       raise @@ wrap_error (Uring.error_of_errno res) "read_exactly" ""
     )
 
   let read_upto ?file_offset fd buf len =
-    let res = Effect.perform (ERead (file_offset, fd, buf, Upto len)) in
+    let res = perform (ERead (file_offset, fd, buf, Upto len)) in
     Log.debug (fun l -> l "read_upto: woken up after read");
     if res < 0 then (
       raise @@ wrap_error (Uring.error_of_errno res) "read_upto" ""
@@ -749,23 +748,23 @@ module Low_level = struct
       raise (unclassified_error (Eio_unix.Unix_error (Uring.error_of_errno res, "await_writable", "")))
     )
 
-  type _ Effect.t += EWrite : (Optint.Int63.t option * FD.t * Uring.Region.chunk * amount) -> int Effect.t
+  exception%effect EWrite : (Optint.Int63.t option * FD.t * Uring.Region.chunk * amount) -> int
 
   let write ?file_offset fd buf len =
-    let res = Effect.perform (EWrite (file_offset, fd, buf, Exactly len)) in
+    let res = perform (EWrite (file_offset, fd, buf, Exactly len)) in
     Log.debug (fun l -> l "write: woken up after write");
     if res < 0 then (
       raise @@ wrap_error (Uring.error_of_errno res) "write" ""
     )
 
-  type _ Effect.t += Alloc : Uring.Region.chunk option Effect.t
-  let alloc_fixed () = Effect.perform Alloc
+  exception%effect Alloc : Uring.Region.chunk option
+  let alloc_fixed () = perform Alloc
 
-  type _ Effect.t += Alloc_or_wait : Uring.Region.chunk Effect.t
-  let alloc_fixed_or_wait () = Effect.perform Alloc_or_wait
+  exception%effect Alloc_or_wait : Uring.Region.chunk
+  let alloc_fixed_or_wait () = perform Alloc_or_wait
 
-  type _ Effect.t += Free : Uring.Region.chunk -> unit Effect.t
-  let free_fixed buf = Effect.perform (Free buf)
+  exception%effect Free : Uring.Region.chunk -> unit
+  let free_fixed buf = perform (Free buf)
 
   let splice src ~dst ~len =
     let res = enter (enqueue_splice ~src ~dst ~len) in
@@ -1447,129 +1446,109 @@ let rec run : type a.
   let eventfd = FD.placeholder ~seekable:false ~close_unix:false in
   let st = { mem; uring; run_q; io_q; mem_q; eventfd; need_wakeup = Atomic.make false; sleep_q } in
   Log.debug (fun l -> l "starting main thread");
+  
   let rec fork ~new_fiber:fiber fn =
-    let open Effect.Deep in
     Ctf.note_switch (Fiber_context.tid fiber);
-    match_with fn ()
-      { retc = (fun () -> Fiber_context.destroy fiber; schedule st);
-        exnc = (fun ex ->
-            Fiber_context.destroy fiber;
-            Printexc.raise_with_backtrace ex (Printexc.get_raw_backtrace ())
+    match fn () with
+    | () -> Fiber_context.destroy fiber; schedule st
+    | exception ex -> 
+      Fiber_context.destroy fiber;
+      Printexc.raise_with_backtrace ex (Printexc.get_raw_backtrace ())
+    | [%effect? Enter fn, k] ->
+      (match Fiber_context.get_error fiber with
+      | Some e -> discontinue k e
+      | None ->
+        let k = { Suspended.k; fiber } in
+        fn st k;
+        schedule st)
+    | [%effect? Low_level.ERead args, k] ->
+      let k = { Suspended.k; fiber } in
+      enqueue_read st k args;
+      schedule st
+    | [%effect? Close fd, k] ->
+      let k = { Suspended.k; fiber } in
+      enqueue_close st k fd;
+      schedule st
+    | [%effect? Cancel job, k] ->
+      enqueue_cancel job st;
+      continue k ()
+    | [%effect? Low_level.EWrite args, k] ->
+      let k = { Suspended.k; fiber } in
+      enqueue_write st k args;
+      schedule st
+    | [%effect? Low_level.Sleep_until time, k] ->
+      let k = { Suspended.k; fiber } in
+      (match Fiber_context.get_error fiber with
+      | Some ex -> Suspended.discontinue k ex
+      | None ->
+        let job = Zzz.add sleep_q time k in
+        Fiber_context.set_cancel_fn fiber (fun ex ->
+            Zzz.remove sleep_q job;
+            enqueue_failed_thread st k ex
           );
-        effc = fun (type a) (e : a Effect.t) ->
-          match e with
-          | Enter fn -> Some (fun k ->
-              match Fiber_context.get_error fiber with
-              | Some e -> discontinue k e
-              | None ->
-                let k = { Suspended.k; fiber } in
-                fn st k;
-                schedule st
-            )
-          | Low_level.ERead args -> Some (fun k ->
-              let k = { Suspended.k; fiber } in
-              enqueue_read st k args;
-              schedule st)
-          | Close fd -> Some (fun k ->
-              let k = { Suspended.k; fiber } in
-              enqueue_close st k fd;
-              schedule st
-            )
-          | Cancel job -> Some (fun k ->
-              enqueue_cancel job st;
-              continue k ()
-            )
-          | Low_level.EWrite args -> Some (fun k ->
-              let k = { Suspended.k; fiber } in
-              enqueue_write st k args;
-              schedule st
-            )
-          | Low_level.Sleep_until time -> Some (fun k ->
-              let k = { Suspended.k; fiber } in
-              match Fiber_context.get_error fiber with
-              | Some ex -> Suspended.discontinue k ex
-              | None ->
-                let job = Zzz.add sleep_q time k in
-                Fiber_context.set_cancel_fn fiber (fun ex ->
-                    Zzz.remove sleep_q job;
-                    enqueue_failed_thread st k ex
-                  );
-                schedule st
-            )
-          | Eio.Private.Effects.Get_context -> Some (fun k -> continue k fiber)
-          | Eio.Private.Effects.Suspend f -> Some (fun k ->
-              let k = { Suspended.k; fiber } in
-              f fiber (function
-                  | Ok v -> enqueue_thread st k v
-                  | Error ex -> enqueue_failed_thread st k ex
-                );
-              schedule st
-            )
-          | Eio.Private.Effects.Fork (new_fiber, f) -> Some (fun k ->
-              let k = { Suspended.k; fiber } in
-              enqueue_at_head st k ();
-              fork ~new_fiber f
-            )
-          | Eio_unix.Private.Await_readable fd -> Some (fun k ->
-              match Fiber_context.get_error fiber with
-              | Some e -> discontinue k e
-              | None ->
-                let k = { Suspended.k; fiber } in
-                enqueue_poll_add_unix fd Uring.Poll_mask.(pollin + pollerr) st k (fun res ->
-                    if res >= 0 then Suspended.continue k ()
-                    else Suspended.discontinue k (Unix.Unix_error (Uring.error_of_errno res, "await_readable", ""))
-                  );
-                schedule st
-            )
-          | Eio_unix.Private.Await_writable fd -> Some (fun k ->
-              match Fiber_context.get_error fiber with
-              | Some e -> discontinue k e
-              | None ->
-                let k = { Suspended.k; fiber } in
-                enqueue_poll_add_unix fd Uring.Poll_mask.(pollout + pollerr) st k (fun res ->
-                    if res >= 0 then Suspended.continue k ()
-                    else Suspended.discontinue k (Unix.Unix_error (Uring.error_of_errno res, "await_writable", ""))
-                  );
-                schedule st
-            )
-          | Eio_unix.Private.Get_monotonic_clock -> Some (fun k -> continue k mono_clock)
-          | Eio_unix.Private.Socket_of_fd (sw, close_unix, fd) -> Some (fun k ->
-              let fd = FD.of_unix ~sw ~seekable:false ~close_unix fd in
-              continue k (flow fd :> Eio_unix.socket)
-            )
-          | Eio_unix.Private.Socketpair (sw, domain, ty, protocol) -> Some (fun k ->
-              let a, b = Unix.socketpair ~cloexec:true domain ty protocol in
-              let a = FD.of_unix ~sw ~seekable:false ~close_unix:true a |> flow in
-              let b = FD.of_unix ~sw ~seekable:false ~close_unix:true b |> flow in
-              continue k ((a :> Eio_unix.socket), (b :> Eio_unix.socket))
-            )
-          | Eio_unix.Private.Pipe sw -> Some (fun k ->
-              let r, w = Unix.pipe ~cloexec:true () in
-              (* See issue #319, PR #327 *)
-              Unix.set_nonblock r;
-              Unix.set_nonblock w;
-              let r = (flow (FD.of_unix ~sw ~seekable:false ~close_unix:true r) :> <Eio.Flow.source; Eio.Flow.close; Eio_unix.unix_fd>) in
-              let w = (flow (FD.of_unix ~sw ~seekable:false ~close_unix:true w) :> <Eio.Flow.sink; Eio.Flow.close; Eio_unix.unix_fd>) in
-              continue k (r, w)
-            )
-          | Low_level.Alloc -> Some (fun k ->
-              match st.mem with
-              | None -> continue k None
-              | Some mem ->
-                match Uring.Region.alloc mem with
-                | buf -> continue k (Some buf)
-                | exception Uring.Region.No_space -> continue k None
-            )
-          | Low_level.Alloc_or_wait -> Some (fun k ->
-              let k = { Suspended.k; fiber } in
-              Low_level.alloc_buf_or_wait st k
-            )
-          | Low_level.Free buf -> Some (fun k ->
-              Low_level.free_buf st buf;
-              continue k ()
-            )
-          | _ -> None
-      }
+        schedule st)
+    | [%effect? Eio.Private.Effects.Get_context, k] -> continue k fiber
+    | [%effect? Eio.Private.Effects.Suspend f, k] ->
+      let k = { Suspended.k; fiber } in
+      f fiber (function
+          | Ok v -> enqueue_thread st k v
+          | Error ex -> enqueue_failed_thread st k ex
+        );
+      schedule st
+    | [%effect? Eio.Private.Effects.Fork (new_fiber, f), k] ->
+      let k = { Suspended.k; fiber } in
+      enqueue_at_head st k ();
+      fork ~new_fiber f
+    | [%effect? Eio_unix.Private.Await_readable fd, k] ->
+      (match Fiber_context.get_error fiber with
+      | Some e -> discontinue k e
+      | None ->
+        let k = { Suspended.k; fiber } in
+        enqueue_poll_add_unix fd Uring.Poll_mask.(pollin + pollerr) st k (fun res ->
+            if res >= 0 then Suspended.continue k ()
+            else Suspended.discontinue k (Unix.Unix_error (Uring.error_of_errno res, "await_readable", ""))
+          );
+        schedule st)
+    | [%effect? Eio_unix.Private.Await_writable fd, k] ->
+      (match Fiber_context.get_error fiber with
+      | Some e -> discontinue k e
+      | None ->
+        let k = { Suspended.k; fiber } in
+        enqueue_poll_add_unix fd Uring.Poll_mask.(pollout + pollerr) st k (fun res ->
+            if res >= 0 then Suspended.continue k ()
+            else Suspended.discontinue k (Unix.Unix_error (Uring.error_of_errno res, "await_writable", ""))
+          );
+        schedule st)
+    | [%effect? Eio_unix.Private.Get_monotonic_clock, k] -> continue k mono_clock
+    | [%effect? Eio_unix.Private.Socket_of_fd (sw, close_unix, fd), k] ->
+      let fd = FD.of_unix ~sw ~seekable:false ~close_unix fd in
+      continue k (flow fd :> Eio_unix.socket)
+    | [%effect? Eio_unix.Private.Socketpair (sw, domain, ty, protocol), k] ->
+      let a, b = Unix.socketpair ~cloexec:true domain ty protocol in
+      let a = FD.of_unix ~sw ~seekable:false ~close_unix:true a |> flow in
+      let b = FD.of_unix ~sw ~seekable:false ~close_unix:true b |> flow in
+      continue k ((a :> Eio_unix.socket), (b :> Eio_unix.socket))
+    | [%effect? Eio_unix.Private.Pipe sw, k] ->
+      let r, w = Unix.pipe ~cloexec:true () in
+      (* See issue #319, PR #327 *)
+      Unix.set_nonblock r;
+      Unix.set_nonblock w;
+      let r = (flow (FD.of_unix ~sw ~seekable:false ~close_unix:true r) :> <Eio.Flow.source; Eio.Flow.close; Eio_unix.unix_fd>) in
+      let w = (flow (FD.of_unix ~sw ~seekable:false ~close_unix:true w) :> <Eio.Flow.sink; Eio.Flow.close; Eio_unix.unix_fd>) in
+      continue k (r, w)
+    | [%effect? Low_level.Alloc, k] ->
+      (match st.mem with
+      | None -> continue k None
+      | Some mem ->
+        (match Uring.Region.alloc mem with
+        | buf -> continue k (Some buf)
+        | exception Uring.Region.No_space -> continue k None))
+    | [%effect? Low_level.Alloc_or_wait, k] ->
+      let k = { Suspended.k; fiber } in
+      Low_level.alloc_buf_or_wait st k
+    | [%effect? Low_level.Free buf, k] ->
+      Low_level.free_buf st buf;
+      continue k ()
   in
   let result = ref None in
   let `Exit_scheduler =

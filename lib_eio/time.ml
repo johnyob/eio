@@ -88,7 +88,7 @@ module Timeout = struct
   let pp f = function
     | Unlimited -> Fmt.string f "(no timeout)"
     | Timeout (_clock, d) ->
-      let d = Mtime.Span.to_float_ns d /. 1e9 in
+      let d = Mtime.Span.to_ns d /. 1e9 in
       pp_duration f d
     | Deprecated (_clock, d) ->
       pp_duration f d

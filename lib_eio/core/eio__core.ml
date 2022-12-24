@@ -12,9 +12,8 @@ module Private = struct
 
   module Effects = struct
     type 'a enqueue = 'a Suspend.enqueue
-    type _ Effect.t +=
-      | Suspend = Suspend.Suspend
-      | Fork = Fiber.Fork
-      | Get_context = Cancel.Get_context
+    exception%effect Suspend = Suspend.Suspend
+    exception%effect Fork = Fiber.Fork
+    exception%effect Get_context = Cancel.Get_context
   end
 end

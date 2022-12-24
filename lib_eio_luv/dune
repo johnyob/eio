@@ -1,4 +1,5 @@
 (library
  (name eio_luv)
  (public_name eio_luv)
+ (preprocess (pps ppx_effects))
  (libraries eio eio.unix luv luv_unix eio.utils logs fmt))

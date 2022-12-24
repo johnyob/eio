@@ -1,4 +1,5 @@
 (library
   (name eio_mock)
   (public_name eio.mock)
-  (libraries eio eio.utils))
+  (libraries eio eio.utils)
+  (preprocess (pps ppx_effects)))

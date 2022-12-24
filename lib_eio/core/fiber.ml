@@ -1,4 +1,4 @@
-type _ Effect.t += Fork : Cancel.fiber_context * (unit -> unit) -> unit Effect.t
+exception%effect Fork : Cancel.fiber_context * (unit -> unit) -> unit
 
 let yield () =
   let fiber = Suspend.enter (fun fiber enqueue -> enqueue (Ok fiber)) in
@@ -6,7 +6,7 @@ let yield () =
 
 (* Note: [f] must not raise an exception, as that would terminate the whole scheduler. *)
 let fork_raw new_fiber f =
-  Effect.perform (Fork (new_fiber, f))
+  perform (Fork (new_fiber, f))
 
 let fork ~sw f =
   Switch.check_our_domain sw;
@@ -159,7 +159,7 @@ let any fs =
 let first f g = any [f; g]
 
 let check () =
-  let ctx = Effect.perform Cancel.Get_context in
+  let ctx = perform Cancel.Get_context in
   Cancel.check ctx.cancel_context
 
 (* Some concurrent list operations *)
@@ -278,9 +278,9 @@ let create_key () = Hmap.Key.create ()
 let get key = Hmap.find key (Cancel.Fiber_context.get_vars ())
 
 let with_binding var value fn =
-  let ctx = Effect.perform Cancel.Get_context in
+  let ctx = perform Cancel.Get_context in
   Cancel.Fiber_context.with_vars ctx (Hmap.add var value ctx.vars) fn
 
 let without_binding var fn =
-  let ctx = Effect.perform Cancel.Get_context in
+  let ctx = perform Cancel.Get_context in
   Cancel.Fiber_context.with_vars ctx (Hmap.rem var ctx.vars) fn
