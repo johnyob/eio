@@ -29,7 +29,7 @@ and fiber_context = {
   mutable vars : Hmap.t;
 }
 
-type _ Effect.t += Get_context : fiber_context Effect.t
+exception%effect Get_context : fiber_context
 
 let pp_state f t =
   begin match t.state with
@@ -118,7 +118,7 @@ let with_cc ~ctx:fiber ~parent ~protected fn =
   | exception ex -> cleanup (); raise ex
 
 let protect fn =
-  let ctx = Effect.perform Get_context in
+  let ctx = perform Get_context in
   with_cc ~ctx ~parent:ctx.cancel_context ~protected:true @@ fun _ ->
   (* Note: there is no need to check the new context after [fn] returns;
      the goal of cancellation is only to finish the thread promptly, not to report the error.
@@ -165,7 +165,7 @@ let cancel t ex =
   )
 
 let sub fn =
-  let ctx = Effect.perform Get_context in
+  let ctx = perform Get_context in
   let parent = ctx.cancel_context in
   with_cc ~ctx ~parent ~protected:false @@ fun t ->
   fn t
@@ -173,7 +173,7 @@ let sub fn =
 (* Like [sub], but it's OK if the new context is cancelled.
    (instead, return the parent context on exit so the caller can check that) *)
 let sub_unchecked fn =
-  let ctx = Effect.perform Get_context in
+  let ctx = perform Get_context in
   let parent = ctx.cancel_context in
   with_cc ~ctx ~parent ~protected:false @@ fun t ->
   fn t;
@@ -211,7 +211,7 @@ module Fiber_context = struct
   let vars t = t.vars
 
   let get_vars () =
-    vars (Effect.perform Get_context)
+    vars (perform Get_context)
 
   let with_vars t vars fn =
     let old_vars = t.vars in

@@ -663,19 +663,18 @@ module Private : sig
     type 'a enqueue = ('a, exn) result -> unit
     (** A function provided by the scheduler to reschedule a previously-suspended thread. *)
 
-    type _ Effect.t +=
-      | Suspend : (Fiber_context.t -> 'a enqueue -> unit) -> 'a Effect.t
+    exception%effect Suspend : (Fiber_context.t -> 'a enqueue -> unit) -> 'a 
       (** [Suspend fn] is performed when a fiber must be suspended
           (e.g. because it called {!Promise.await} on an unresolved promise).
           The effect handler runs [fn fiber enqueue] in the scheduler context,
           passing it the suspended fiber's context and a function to resume it.
           [fn] should arrange for [enqueue] to be called once the thread is ready to run again. *)
 
-      | Fork : Fiber_context.t * (unit -> unit) -> unit Effect.t
+    exception%effect Fork : Fiber_context.t * (unit -> unit) -> unit
       (** [perform (Fork new_context f)] creates a new fiber and runs [f] in it, with context [new_context].
           [f] must not raise an exception. See {!Fiber.fork}. *)
 
-      | Get_context : Fiber_context.t Effect.t
+    exception%effect Get_context : Fiber_context.t
       (** [perform Get_context] immediately returns the current fiber's context (without switching fibers). *)
   end
 
